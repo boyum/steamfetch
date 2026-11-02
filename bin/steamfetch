@@ -1,0 +1,401 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION="0.1.0"
+DEFAULT_OS="windows"
+DEFAULT_ARCH="64"
+
+APP_ID=""
+OUT_DIR=""
+USERNAME="${STEAM_USERNAME:-}"
+ANONYMOUS=0
+QR=0
+REMEMBER=0
+VALIDATE=0
+TARGET_OS="$DEFAULT_OS"
+TARGET_ARCH="$DEFAULT_ARCH"
+ARCH_SET=0
+ALL_ARCHS=0
+LANGUAGE=""
+LANGUAGE_SET=0
+ALL_LANGUAGES=0
+MANIFEST_ONLY=0
+DRY_RUN=0
+NO_SUBFOLDER=0
+EXTRA_ARGS=()
+
+usage() {
+  cat <<'EOF'
+steamfetch 0.1.0
+Download Steam game files for a platform other than the host (default: Windows).
+
+Usage:
+  steamfetch [APPID|STORE_URL] [options] [-- <DepotDownloader args>]
+
+If APPID is omitted, you will be prompted.
+
+Options:
+  -d, --dir DIR          Base output directory (default: current directory)
+      --no-subfolder     Download directly into --dir instead of a game-named folder
+  -u, --username USER    Steam username (prompted if omitted)
+      --qr               Log in by scanning a QR code with the Steam mobile app
+      --anonymous        Use an anonymous login (only works for free apps)
+      --remember         Ask DepotDownloader to remember the Steam login token
+      --validate         Validate files that already exist
+  -o, --os OS            Target platform: windows, macos, or linux (default: windows)
+      --arch ARCH        Target architecture: 64 or 32 (default: 64)
+      --all-archs        Download all architecture-specific depots
+      --language LANG    Language to download (default: english)
+      --all-languages    Download all language depots
+      --manifest-only    Download manifests only, without game files
+      --dry-run          Print what would be run without downloading
+  -h, --help             Show this help
+  -V, --version          Show version
+
+Environment:
+  STEAMFETCH_DEPOTDOWNLOADER  Path to a DepotDownloader executable
+
+Examples:
+  steamfetch 3242710
+  steamfetch https://store.steampowered.com/app/3242710/Gambeat/
+  steamfetch 3242710 --dir ~/Games
+  steamfetch 3242710 --username myuser --remember
+  steamfetch 480 --anonymous
+
+Notes:
+  - You must own the game. DepotDownloader does not bypass ownership or DRM.
+  - This only downloads files. Running Windows games on macOS requires
+    Whisky, CrossOver, Parallels, or similar.
+EOF
+}
+
+die() {
+  printf 'steamfetch: %s\n' "$*" >&2
+  exit 1
+}
+
+resolve_app_id() {
+  local input="$1"
+  if [[ "$input" =~ ^[0-9]+$ ]]; then
+    printf '%s' "$input"
+  elif [[ "$input" =~ /app/([0-9]+) ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+  else
+    die "invalid app id or store URL: $input"
+  fi
+}
+
+fetch_game_name() {
+  local appid="$1" json name=""
+  if ! command -v curl >/dev/null 2>&1; then
+    return 0
+  fi
+  json="$(curl -fsSL --compressed --max-time 15 --retry 1 \
+    "https://store.steampowered.com/api/appdetails?appids=${appid}&filters=basic" \
+    2>/dev/null || true)"
+  if [[ -z "$json" ]]; then
+    return 0
+  fi
+  if command -v jq >/dev/null 2>&1; then
+    name="$(printf '%s' "$json" | jq -r --arg id "$appid" '.[$id].data.name // empty' 2>/dev/null || true)"
+  elif command -v python3 >/dev/null 2>&1; then
+    name="$(printf '%s' "$json" | python3 -c 'import json, sys
+data = json.load(sys.stdin)
+value = data.get(sys.argv[1], {}).get("data", {}).get("name", "")
+if value:
+    print(value)' "$appid" 2>/dev/null || true)"
+  fi
+  printf '%s' "$name"
+}
+
+sanitize_name() {
+  printf '%s' "$1" | tr '/\\:' '___' | tr -d '\r\n' | \
+    sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
+
+expand_tilde() {
+  case "$1" in
+    "~") printf '%s' "$HOME" ;;
+    "~/"*) printf '%s/%s' "$HOME" "${1#\~/}" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+find_depotdownloader() {
+  local candidate="" script_dir=""
+  if [[ -n "${STEAMFETCH_DEPOTDOWNLOADER:-}" ]]; then
+    if [[ ! -x "$STEAMFETCH_DEPOTDOWNLOADER" ]]; then
+      die "STEAMFETCH_DEPOTDOWNLOADER is not executable: $STEAMFETCH_DEPOTDOWNLOADER"
+    fi
+    printf '%s' "$STEAMFETCH_DEPOTDOWNLOADER"
+    return 0
+  fi
+  if candidate="$(command -v steamfetch-depotdownloader 2>/dev/null)" && [[ -n "$candidate" ]]; then
+    printf '%s' "$candidate"
+    return 0
+  fi
+  if candidate="$(command -v DepotDownloader 2>/dev/null)" && [[ -n "$candidate" ]]; then
+    printf '%s' "$candidate"
+    return 0
+  fi
+  candidate="@LIBEXEC@/DepotDownloader"
+  if [[ "$candidate" != *"@LIBEXEC@"* ]] && [[ -x "$candidate" ]]; then
+    printf '%s' "$candidate"
+    return 0
+  fi
+  script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+  candidate="$script_dir/../libexec/DepotDownloader"
+  if [[ -x "$candidate" ]]; then
+    printf '%s' "$candidate"
+    return 0
+  fi
+  die "DepotDownloader not found. Reinstall with 'brew reinstall --cask boyum/steamfetch/steamfetch' or set STEAMFETCH_DEPOTDOWNLOADER."
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    -V|--version)
+      printf 'steamfetch %s\n' "$VERSION"
+      exit 0
+      ;;
+    -d|--dir)
+      [[ $# -ge 2 ]] || die "$1 requires a value"
+      OUT_DIR="$2"
+      shift 2
+      ;;
+    -d=*|--dir=*)
+      OUT_DIR="${1#*=}"
+      shift
+      ;;
+    --no-subfolder)
+      NO_SUBFOLDER=1
+      shift
+      ;;
+    -u|--username)
+      [[ $# -ge 2 ]] || die "$1 requires a value"
+      USERNAME="$2"
+      shift 2
+      ;;
+    -u=*|--username=*)
+      USERNAME="${1#*=}"
+      shift
+      ;;
+    --qr)
+      QR=1
+      shift
+      ;;
+    --anonymous)
+      ANONYMOUS=1
+      shift
+      ;;
+    --remember)
+      REMEMBER=1
+      shift
+      ;;
+    --validate)
+      VALIDATE=1
+      shift
+      ;;
+    -o|--os)
+      [[ $# -ge 2 ]] || die "$1 requires a value"
+      TARGET_OS="$2"
+      shift 2
+      ;;
+    -o=*|--os=*)
+      TARGET_OS="${1#*=}"
+      shift
+      ;;
+    --arch)
+      [[ $# -ge 2 ]] || die "$1 requires a value"
+      TARGET_ARCH="$2"
+      ARCH_SET=1
+      shift 2
+      ;;
+    --arch=*)
+      TARGET_ARCH="${1#*=}"
+      ARCH_SET=1
+      shift
+      ;;
+    --all-archs)
+      ALL_ARCHS=1
+      shift
+      ;;
+    --language)
+      [[ $# -ge 2 ]] || die "$1 requires a value"
+      LANGUAGE="$2"
+      LANGUAGE_SET=1
+      shift 2
+      ;;
+    --language=*)
+      LANGUAGE="${1#*=}"
+      LANGUAGE_SET=1
+      shift
+      ;;
+    --all-languages)
+      ALL_LANGUAGES=1
+      shift
+      ;;
+    --manifest-only)
+      MANIFEST_ONLY=1
+      shift
+      ;;
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    --)
+      shift
+      EXTRA_ARGS+=("$@")
+      break
+      ;;
+    -*)
+      die "unknown option: $1 (see --help)"
+      ;;
+    *)
+      if [[ -z "$APP_ID" ]]; then
+        APP_ID="$1"
+        shift
+      else
+        die "unexpected argument: $1"
+      fi
+      ;;
+  esac
+done
+
+case "$TARGET_OS" in
+  windows|macos|linux) ;;
+  *) die "invalid --os value: $TARGET_OS (expected windows, macos, or linux)" ;;
+esac
+
+case "$TARGET_ARCH" in
+  32|64) ;;
+  *) die "invalid --arch value: $TARGET_ARCH (expected 32 or 64)" ;;
+esac
+
+if [[ "$ALL_ARCHS" -eq 1 && "$ARCH_SET" -eq 1 ]]; then
+  die "--all-archs cannot be combined with --arch"
+fi
+
+if [[ "$ALL_LANGUAGES" -eq 1 && "$LANGUAGE_SET" -eq 1 ]]; then
+  die "--all-languages cannot be combined with --language"
+fi
+
+if [[ "$ANONYMOUS" -eq 1 && -n "$USERNAME" ]]; then
+  die "--anonymous cannot be combined with --username"
+fi
+
+if [[ "$ANONYMOUS" -eq 1 && "$QR" -eq 1 ]]; then
+  die "--anonymous cannot be combined with --qr"
+fi
+
+if [[ "$QR" -eq 1 && -n "$USERNAME" ]]; then
+  die "--qr cannot be combined with --username"
+fi
+
+if [[ -z "$APP_ID" ]]; then
+  if [[ -t 0 ]]; then
+    if ! read -r -p "Steam App ID or store URL: " APP_ID; then
+      die "no app id provided"
+    fi
+  else
+    die "no app id provided"
+  fi
+fi
+
+[[ -n "$APP_ID" ]] || die "no app id provided"
+APP_ID="$(resolve_app_id "$APP_ID")"
+
+if [[ "$ANONYMOUS" -eq 0 && "$QR" -eq 0 && -z "$USERNAME" ]]; then
+  if [[ -t 0 ]]; then
+    if ! read -r -p "Steam username: " USERNAME; then
+      die "no username provided"
+    fi
+  else
+    die "no username provided (use --username, --qr, or --anonymous)"
+  fi
+  [[ -n "$USERNAME" ]] || die "no username provided"
+fi
+
+if [[ -n "$OUT_DIR" ]]; then
+  OUT_DIR="$(expand_tilde "$OUT_DIR")"
+fi
+
+GAME_NAME="$(fetch_game_name "$APP_ID")"
+if [[ -z "$GAME_NAME" ]]; then
+  GAME_NAME="$APP_ID"
+fi
+
+FOLDER_NAME="$(sanitize_name "$GAME_NAME")"
+case "$FOLDER_NAME" in
+  ""|"."|"..") FOLDER_NAME="$APP_ID" ;;
+esac
+
+BASE_DIR="${OUT_DIR:-$PWD}"
+if [[ "$NO_SUBFOLDER" -eq 1 ]]; then
+  DEST_DIR="$BASE_DIR"
+else
+  DEST_DIR="$BASE_DIR/$FOLDER_NAME"
+fi
+
+DEPOTDOWNLOADER="$(find_depotdownloader)"
+
+ARGS=(-app "$APP_ID")
+
+if [[ "$ANONYMOUS" -eq 0 ]]; then
+  if [[ "$QR" -eq 1 ]]; then
+    ARGS+=(-qr)
+  else
+    ARGS+=(-username "$USERNAME")
+  fi
+fi
+
+ARGS+=(-os "$TARGET_OS")
+
+if [[ "$ALL_ARCHS" -eq 1 ]]; then
+  ARGS+=(-all-archs)
+else
+  ARGS+=(-osarch "$TARGET_ARCH")
+fi
+
+ARGS+=(-dir "$DEST_DIR")
+
+if [[ "$REMEMBER" -eq 1 ]]; then
+  ARGS+=(-remember-password)
+fi
+
+if [[ "$VALIDATE" -eq 1 ]]; then
+  ARGS+=(-validate)
+fi
+
+if [[ "$ALL_LANGUAGES" -eq 1 ]]; then
+  ARGS+=(-all-languages)
+fi
+
+if [[ "$LANGUAGE_SET" -eq 1 ]]; then
+  ARGS+=(-language "$LANGUAGE")
+fi
+
+if [[ "$MANIFEST_ONLY" -eq 1 ]]; then
+  ARGS+=(-manifest-only)
+fi
+
+if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
+  ARGS+=("${EXTRA_ARGS[@]}")
+fi
+
+if [[ "$DRY_RUN" -eq 1 ]]; then
+  printf 'Game: %s (%s)\n' "$GAME_NAME" "$APP_ID"
+  printf 'Destination: %s\n' "$DEST_DIR"
+  printf 'Command:'
+  printf ' %q' "$DEPOTDOWNLOADER" "${ARGS[@]}"
+  printf '\n'
+  exit 0
+fi
+
+mkdir -p "$DEST_DIR"
+printf 'Downloading %s (%s) to %s\n' "$GAME_NAME" "$APP_ID" "$DEST_DIR"
+exec "$DEPOTDOWNLOADER" "${ARGS[@]}"
