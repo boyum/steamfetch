@@ -26,7 +26,7 @@ This installs:
 - `steamfetch`
 - `steamfetch-depotdownloader`
 
-The cask is used instead of a formula because Homebrew's source-build check rejects older Xcode versions. Xcode is not required to install `steamfetch`.
+The installer uses a Homebrew cask with prebuilt binaries, so no compilation is required. It also removes the quarantine attribute from DepotDownloader so macOS can run it.
 
 ## Usage
 
